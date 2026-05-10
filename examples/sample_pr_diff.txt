@@ -1,0 +1,104 @@
+diff --git a/app/auth.py b/app/auth.py
+index 3a1b2c3..4d5e6f7 100644
+--- a/app/auth.py
++++ b/app/auth.py
+@@ -1,42 +1,67 @@
+-import hashlib
++import hashlib
++import secrets
+ from datetime import datetime, timedelta
+-from flask import request, jsonify
++from flask import request, jsonify, current_app
+ from models import User, db
+
+-SECRET_KEY = "mysecretkey123"
+-TOKEN_EXPIRY = 3600
++TOKEN_EXPIRY_HOURS = int(os.getenv("TOKEN_EXPIRY_HOURS", 24))
+
+ def login():
+     data = request.get_json()
+-    username = data['username']
+-    password = data['password']
++    username = data.get('username', '').strip()
++    password = data.get('password', '')
++
++    if not username or not password:
++        return jsonify({"error": "Username and password are required"}), 400
+
+-    user = User.query.filter_by(username=username).first()
++    user = User.query.filter_by(username=username).first()
+
+-    if user and user.password == hashlib.md5(password.encode()).hexdigest():
+-        token = generate_token(user.id)
+-        return jsonify({"token": token})
+-    return jsonify({"error": "Invalid credentials"}), 401
++    if user and user.check_password(password):
++        token = generate_token(user.id)
++        return jsonify({"token": token, "expires_in": TOKEN_EXPIRY_HOURS * 3600})
++    return jsonify({"error": "Invalid credentials"}), 401
+
+-def generate_token(user_id):
+-    payload = f"{user_id}:{datetime.utcnow().timestamp()}"
+-    return hashlib.md5(payload.encode()).hexdigest()
++def generate_token(user_id: int) -> str:
++    token = secrets.token_urlsafe(32)
++    expiry = datetime.utcnow() + timedelta(hours=TOKEN_EXPIRY_HOURS)
++    # TODO: store token in Redis with expiry
++    return token
+
+ def require_auth(f):
+     from functools import wraps
+     @wraps(f)
+     def decorated(*args, **kwargs):
+         token = request.headers.get('Authorization', '').replace('Bearer ', '')
+-        if not token:
++        if not token or len(token) < 10:
+             return jsonify({"error": "Unauthorised"}), 401
+-        # TODO: validate token properly
+-        return f(*args, **kwargs)
++        user = validate_token(token)
++        if not user:
++            return jsonify({"error": "Invalid or expired token"}), 401
++        return f(user, *args, **kwargs)
+     return decorated
+
++def validate_token(token: str):
++    # TODO: look up token from Redis
++    return None  # placeholder — always returns None (auth is broken)
+
+diff --git a/app/users.py b/app/users.py
+index 1a2b3c4..5d6e7f8 100644
+--- a/app/users.py
++++ b/app/users.py
+@@ -1,18 +1,35 @@
+ from flask import request, jsonify
+ from models import User, db
++from auth import require_auth
+
+-def get_users():
+-    users = User.query.all()
+-    return jsonify([{"id": u.id, "username": u.username, "email": u.email} for u in users])
++@require_auth
++def get_users(current_user):
++    page = request.args.get('page', 1, type=int)
++    per_page = request.args.get('per_page', 20, type=int)
++    users = User.query.paginate(page=page, per_page=per_page)
++    return jsonify({
++        "users": [{"id": u.id, "username": u.username} for u in users.items],
++        "total": users.total,
++        "pages": users.pages,
++    })
+
+-def delete_user(user_id):
+-    user = User.query.get(user_id)
+-    db.session.delete(user)
+-    db.session.commit()
+-    return jsonify({"message": "deleted"})
++@require_auth
++def delete_user(current_user, user_id: int):
++    if current_user.role != 'admin':
++        return jsonify({"error": "Forbidden"}), 403
++    user = User.query.get_or_404(user_id)
++    db.session.delete(user)
++    db.session.commit()
++    return jsonify({"message": f"User {user_id} deleted"}), 200
